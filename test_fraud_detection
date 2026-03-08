@@ -1,0 +1,283 @@
+"""
+Unit Tests for Fraud Detector Module
+====================================
+Tests for insurance_claims_analysis.py FraudDetector class
+
+Run with: pytest tests/test_fraud_detector.py -v
+"""
+
+import pytest
+import pandas as pd
+import numpy as np
+from insurance_claims_analysis import (
+    FraudDetector
+)
+
+
+class TestFraudDetector:
+    """Test suite for FraudDetector class"""
+    
+    @pytest.fixture
+    def sample_claims(self):
+        """Create sample claims data for testing"""
+        np.random.seed(42)
+        n_samples = 1000
+        
+        return pd.DataFrame({
+            'claim_id': [f'CLM-{i:05d}' for i in range(n_samples)],
+            'claim_amount': np.random.lognormal(9, 1, n_samples),
+            'claim_type': np.random.choice(['Collision', 'Comprehensive', 'Liability'], n_samples),
+            'vehicle_age': np.random.randint(0, 20, n_samples),
+            'driver_age': np.random.randint(18, 80, n_samples),
+            'num_claims_history': np.random.poisson(1, n_samples),
+            'time_to_report': np.random.exponential(10, n_samples),
+            'fraud_flag': np.random.choice([0, 1], n_samples, p=[0.95, 0.05])
+        })
+    
+    @pytest.fixture
+    def fraud_cases(self):
+        """Create known fraud cases for testing"""
+        return pd.DataFrame({
+            'claim_id': ['FRAUD-001', 'FRAUD-002', 'FRAUD-003'],
+            'claim_amount': [50000, 75000, 100000],  # High amounts
+            'claim_type': ['Liability', 'Collision', 'Comprehensive'],
+            'vehicle_age': [15, 18, 20],  # Old vehicles
+            'driver_age': [25, 30, 35],
+            'num_claims_history': [5, 7, 10],  # Many claims
+            'time_to_report': [0.5, 1.0, 0.3],  # Reported very quickly
+            'fraud_flag': [1, 1, 1]
+        })
+    
+    def test_detector_initialization(self):
+        """Test fraud detector initialization"""
+        detector = FraudDetector(contamination=0.05)
+        
+        assert detector.contamination == 0.05
+        assert detector.isolation_forest is not None
+        assert detector.scaler is not None
+        assert not detector.is_fitted
+    
+    def test_fit_basic(self, sample_claims):
+        """Test basic training"""
+        detector = FraudDetector(contamination=0.05)
+        
+        detector.fit(sample_claims)
+        
+        assert detector.is_fitted
+        assert detector.feature_names is not None
+        assert len(detector.feature_names) > 0
+    
+    def test_fit_insufficient_data(self):
+        """Test training with insufficient data"""
+        detector = FraudDetector()
+        
+        df = pd.DataFrame({'claim_amount': [1000]})
+        
+        with pytest.raises(ValueError):
+            detector.fit(df)
+    
+    def test_predict_before_fitting(self, sample_claims):
+        """Test prediction before fitting raises error"""
+        detector = FraudDetector()
+        
+        with pytest.raises(ValueError, match="must be fitted first"):
+            detector.predict(sample_claims)
+    
+    def test_predict_fraud_scores(self, sample_claims, fraud_cases):
+        """Test fraud score prediction"""
+        detector = FraudDetector(contamination=0.05)
+        
+        # Train on normal + some fraud
+        train_data = pd.concat([sample_claims, fraud_cases])
+        detector.fit(train_data)
+        
+        # Predict on fraud cases
+        anomaly_scores = detector.predict(fraud_cases)
+        
+        assert len(anomaly_scores) == len(fraud_cases)
+        assert all(0 <= score <= 1 for score in anomaly_scores)
+        # Fraud cases should have high anomaly scores
+        assert anomaly_scores.mean() > 0.5
+    
+    def test_predict_normal_cases(self, sample_claims):
+        """Test prediction on normal cases"""
+        detector = FraudDetector(contamination=0.05)
+        
+        # Split data
+        train_data = sample_claims[:800]
+        test_data = sample_claims[800:]
+        
+        detector.fit(train_data)
+        
+        # Predict on normal data
+        anomaly_scores = detector.predict(test_data)
+        
+        # Most should have low anomaly scores
+        assert (anomaly_scores < 0.5).mean() > 0.90
+    
+    def test_fraud_risk_levels(self, sample_claims):
+        """Test fraud risk level classification"""
+        detector = FraudDetector(contamination=0.05)
+        detector.fit(sample_claims)
+        
+        # Create test cases with varying scores
+        test_data = sample_claims.sample(10)
+        scores = detector.predict(test_data)
+        
+        risk_levels = detector.classify_risk_level(scores)
+        
+        assert len(risk_levels) == len(scores)
+        assert all(level in ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'] for level in risk_levels)
+    
+    def test_feature_importance(self, sample_claims):
+        """Test extraction of important fraud indicators"""
+        detector = FraudDetector()
+        detector.fit(sample_claims)
+        
+        # Get suspicious features
+        suspicious_features = detector.get_suspicious_features(sample_claims.iloc[0])
+        
+        assert isinstance(suspicious_features, list)
+    
+    def test_fraud_probability_calculation(self, sample_claims):
+        """Test fraud probability calculation"""
+        detector = FraudDetector()
+        detector.fit(sample_claims)
+        
+        anomaly_scores = detector.predict(sample_claims.head(10))
+        
+        # All probabilities should be valid
+        assert all(0 <= score <= 1 for score in anomaly_scores)
+    
+    def test_contamination_effect(self, sample_claims):
+        """Test effect of contamination parameter"""
+        # Low contamination (expect fewer fraud flags)
+        detector_low = FraudDetector(contamination=0.01)
+        detector_low.fit(sample_claims)
+        scores_low = detector_low.predict(sample_claims)
+        high_risk_low = (scores_low > 0.7).sum()
+        
+        # High contamination (expect more fraud flags)
+        detector_high = FraudDetector(contamination=0.10)
+        detector_high.fit(sample_claims)
+        scores_high = detector_high.predict(sample_claims)
+        high_risk_high = (scores_high > 0.7).sum()
+        
+        # Higher contamination should flag more cases
+        assert high_risk_high >= high_risk_low
+    
+    def test_handle_missing_values(self, sample_claims):
+        """Test handling of missing values"""
+        detector = FraudDetector()
+        
+        # Add missing values
+        test_data = sample_claims.copy()
+        test_data.loc[0:10, 'claim_amount'] = np.nan
+        
+        # Should handle gracefully
+        detector.fit(test_data)
+        scores = detector.predict(test_data)
+        
+        assert detector.is_fitted
+        assert len(scores) == len(test_data)
+
+
+class TestFraudDetectorIntegration:
+    """Integration tests for fraud detection workflow"""
+    
+    def test_end_to_end_fraud_detection(self):
+        """Test complete fraud detection pipeline"""
+        np.random.seed(42)
+        
+        # Create dataset with known fraud patterns
+        normal_claims = pd.DataFrame({
+            'claim_amount': np.random.lognormal(9, 0.5, 950),
+            'num_claims_history': np.random.poisson(1, 950),
+            'time_to_report': np.random.exponential(10, 950),
+            'vehicle_age': np.random.randint(0, 15, 950)
+        })
+        
+        # Inject fraud cases (unusual patterns)
+        fraud_claims = pd.DataFrame({
+            'claim_amount': np.random.uniform(50000, 100000, 50),  # Very high
+            'num_claims_history': np.random.randint(5, 10, 50),    # Many claims
+            'time_to_report': np.random.uniform(0.1, 2, 50),       # Quick report
+            'vehicle_age': np.random.randint(15, 25, 50)           # Old cars
+        })
+        
+        all_claims = pd.concat([normal_claims, fraud_claims], ignore_index=True)
+        
+        # Train detector
+        detector = FraudDetector(contamination=0.05)
+        detector.fit(all_claims)
+        
+        # Predict
+        scores = detector.predict(all_claims)
+        
+        # Fraud cases should generally have higher scores
+        normal_scores = scores[:950]
+        fraud_scores = scores[950:]
+        
+        assert fraud_scores.mean() > normal_scores.mean()
+    
+    def test_precision_recall_tradeoff(self):
+        """Test precision-recall at different thresholds"""
+        np.random.seed(42)
+        
+        # Create labeled data
+        df = pd.DataFrame({
+            'claim_amount': np.concatenate([
+                np.random.lognormal(9, 0.5, 900),  # Normal
+                np.random.uniform(50000, 100000, 100)  # Fraud
+            ]),
+            'num_claims_history': np.concatenate([
+                np.random.poisson(1, 900),  # Normal
+                np.random.randint(5, 10, 100)  # Fraud
+            ]),
+            'fraud_flag': [0]*900 + [1]*100
+        })
+        
+        detector = FraudDetector(contamination=0.10)
+        detector.fit(df)
+        
+        scores = detector.predict(df)
+        
+        # Test different thresholds
+        for threshold in [0.5, 0.7, 0.9]:
+            predictions = (scores > threshold).astype(int)
+            
+            tp = ((predictions == 1) & (df['fraud_flag'] == 1)).sum()
+            fp = ((predictions == 1) & (df['fraud_flag'] == 0)).sum()
+            fn = ((predictions == 0) & (df['fraud_flag'] == 1)).sum()
+            
+            if tp + fp > 0:
+                precision = tp / (tp + fp)
+                assert 0 <= precision <= 1
+            
+            if tp + fn > 0:
+                recall = tp / (tp + fn)
+                assert 0 <= recall <= 1
+    
+    def test_batch_processing(self):
+        """Test processing large batches of claims"""
+        np.random.seed(42)
+        
+        # Large dataset
+        large_dataset = pd.DataFrame({
+            'claim_amount': np.random.lognormal(9, 1, 10000),
+            'num_claims_history': np.random.poisson(1, 10000),
+            'vehicle_age': np.random.randint(0, 20, 10000)
+        })
+        
+        detector = FraudDetector()
+        detector.fit(large_dataset[:8000])
+        
+        # Batch prediction
+        scores = detector.predict(large_dataset[8000:])
+        
+        assert len(scores) == 2000
+        assert all(0 <= score <= 1 for score in scores)
+
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v', '--tb=short'])
