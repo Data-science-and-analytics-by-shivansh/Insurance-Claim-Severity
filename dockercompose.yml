@@ -1,0 +1,170 @@
+version: '3.8'
+
+services:
+  # Fraud Detection API
+  fraud-detection-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fraud-detection-api
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./logs:/app/logs
+      - ./output:/app/output
+    environment:
+      - MODEL_PATH=/app/models
+      - DATA_PATH=/app/data
+      - LOG_LEVEL=INFO
+      - FRAUD_THRESHOLD=0.7
+      - CONTAMINATION=0.05
+    restart: unless-stopped
+    networks:
+      - fraud-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import insurance_claims_analysis; print('OK')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      - postgres
+      - redis
+
+  # PostgreSQL for claims storage
+  postgres:
+    image: postgres:14-alpine
+    container_name: fraud-postgres
+    environment:
+      POSTGRES_DB: fraud_detection_db
+      POSTGRES_USER: fraud_user
+      POSTGRES_PASSWORD: fraud_secure_pass_123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - fraud-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fraud_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for caching and queue
+  redis:
+    image: redis:7-alpine
+    container_name: fraud-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - fraud-network
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass redis_secure_pass
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Model Training Worker (optional - for scheduled retraining)
+  model-trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fraud-model-trainer
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./logs:/app/logs
+    environment:
+      - MODEL_PATH=/app/models
+      - DATA_PATH=/app/data
+      - TRAINING_SCHEDULE=daily
+    networks:
+      - fraud-network
+    command: python -c "from insurance_claims_analysis import train_models; train_models()"
+    restart: "no"
+    profiles:
+      - training
+
+  # Jupyter Notebook for analysis (development)
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fraud-jupyter
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./notebooks:/app/notebooks
+      - ./data:/app/data
+      - ./models:/app/models
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+    command: >
+      jupyter lab
+      --ip=0.0.0.0
+      --port=8888
+      --no-browser
+      --allow-root
+      --NotebookApp.token=''
+      --NotebookApp.password=''
+    networks:
+      - fraud-network
+    restart: unless-stopped
+    profiles:
+      - dev
+
+  # Grafana for monitoring dashboards
+  grafana:
+    image: grafana/grafana:latest
+    container_name: fraud-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    networks:
+      - fraud-network
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: fraud-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - fraud-network
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+networks:
+  fraud-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  grafana-data:
+  prometheus-data:
